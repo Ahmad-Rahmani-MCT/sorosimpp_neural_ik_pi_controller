@@ -1,0 +1,4 @@
+<launch>
+  <node name="primitive_controller" pkg="sorosimpp_neural_ik_pi_controller" type="motionprimitive_controller.py" output="screen" />
+  <node name="topic_listener_logger" pkg="sorosimpp_neural_ik_pi_controller" type="topic_subscriber_logger.py" output="screen" />
+</launch>
