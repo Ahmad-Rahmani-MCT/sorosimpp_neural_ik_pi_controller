@@ -40,8 +40,8 @@ TARGET_TOLERANCE = 0.01 # within 1 cm
 
 # --- PI Fine Tuning Gains ---
 # CRITICAL: Negative Gains because robot bends AWAY from actuator
-PID_KP = -210.0  
-PID_KI = -180.0   
+PID_KP = -20  
+PID_KI = -20   
 
 # actuator angles
 ACT_ANGLES = [math.radians(90), math.radians(330), math.radians(210)]
@@ -77,10 +77,10 @@ inverse_model.eval()
 
 with open(os.path.join(scaler_directory, "input_scaler_lines.pkl"), 'rb') as file: 
     input_scaler = pickle.load(file) 
-with open(os.path.join(scaler_directory, "state_scaler_lines.pk"), 'rb') as file:
+with open(os.path.join(scaler_directory, "state_scaler_lines.pkl"), 'rb') as file:
     state_scaler = pickle.load(file)  
-with open(os.path.join(scaler_directory, "ee_xy_scaler.pk"), 'rb') as file:
-    state_scaler = pickle.load(file) 
+with open(os.path.join(scaler_directory, "ee_xy_scaler.pkl"), 'rb') as file:
+    ee_xy_scaler = pickle.load(file) 
 
 # path generator
 def lin_path_gen(x_des, y_des, x_init, y_init, num_points):  
@@ -263,7 +263,7 @@ class IK_CTRL_SYS:
 # execution 
 def main(): 
     rospy.init_node("IK_cntrl_sys", anonymous=True) 
-    raw_des_trajectory = lin_path_gen(0.2, 0.2, 0, 0, 40) 
+    raw_des_trajectory = lin_path_gen(0.05, 0.05, 0, 0, 40) 
     IK_CTRL_SYS(n_act=N_ACT, req_frames=REQUIRED_FRAMES, state_scaler=state_scaler, input_scaler=input_scaler, IK_model=inverse_model,
                 des_trajectory=raw_des_trajectory)
     rospy.spin() 
