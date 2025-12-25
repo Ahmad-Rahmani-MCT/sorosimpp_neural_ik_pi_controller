@@ -12,7 +12,7 @@ QUEUE_SIZE = 10
 NODE_FREQUENCY = 20.0  # [Hz] # node publishing frequency 
 SOROSIM_TAG = "/sorosimpp" # initial part of the topic name to publish the actuation messages
 CONTROL_BOX_TOPIC = "control_box_topic"
-PRIMITIVE = "lines_random" #options are : motor_babbling, lines_random
+PRIMITIVE = "motor_babbling" #options are : motor_babbling, lines_random
 
 ## Primitive Parameters ##
 N_ACT = 3  # Number of actuators
