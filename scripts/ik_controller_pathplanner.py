@@ -38,8 +38,8 @@ ACTUATION_LIMIT_MAX = 18.0
 ACTUATION_RATE_LIMIT = 0.6 
 TARGET_TOLERANCE = 0.01 # within 1 cm
 
-# --- PI Fine Tuning Gains ---
-# CRITICAL: Negative Gains because robot bends AWAY from actuator
+# PI gains
+# negative gains because robot bends AWAY from actuator
 PID_KP = -20  
 PID_KI = -20   
 
