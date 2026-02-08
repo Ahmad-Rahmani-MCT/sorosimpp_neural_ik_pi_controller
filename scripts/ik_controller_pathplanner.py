@@ -263,7 +263,7 @@ class IK_CTRL_SYS:
 # execution 
 def main(): 
     rospy.init_node("IK_cntrl_sys", anonymous=True) 
-    raw_des_trajectory = lin_path_gen(0.05, 0.05, 0, 0, 40) 
+    raw_des_trajectory = lin_path_gen(-0.07, -0.07, 0, 0, 40) 
     IK_CTRL_SYS(n_act=N_ACT, req_frames=REQUIRED_FRAMES, state_scaler=state_scaler, input_scaler=input_scaler, IK_model=inverse_model,
                 des_trajectory=raw_des_trajectory)
     rospy.spin() 

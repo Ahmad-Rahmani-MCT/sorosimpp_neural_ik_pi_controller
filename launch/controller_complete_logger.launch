@@ -1,0 +1,4 @@
+<launch>
+  <node name="neural_controller" pkg="sorosimpp_neural_ik_pi_controller" type="ik_controller_pathplanner.py" output="screen" />
+  <node name="full_logger" pkg="sorosimpp_neural_ik_pi_controller" type="complete_frame_logger.py" output="screen" />
+</launch>
