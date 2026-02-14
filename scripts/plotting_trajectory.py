@@ -88,7 +88,15 @@ def generate_static_plot(df, script_dir):
     print("\n[1/3] Generating Static Plot...")
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
-    ax.set_title("Soft Robot Bending Evolution", fontsize=16)
+
+    # --- Calculate Distance ---
+    final_tip = np.array([df.iloc[-1]['tip_pos_x'], df.iloc[-1]['tip_pos_y'], df.iloc[-1]['tip_pos_z']])
+    dist_str = ""
+    if GOAL_POSITION:
+        dist = np.linalg.norm(final_tip - np.array(GOAL_POSITION))
+        dist_str = f" | Goal-Tip Dist: {dist:.4f}m"
+    
+    ax.set_title(f"Soft Robot Bending Evolution{dist_str}", fontsize=16)
     
     setup_axes(ax)
     colormap = matplotlib.colormaps['jet']
@@ -154,7 +162,15 @@ def generate_trace_animation(df, script_dir):
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
     setup_axes(ax)
-    ax.set_title("Soft Robot Trajectory Evolution")
+
+    # --- Calculate Distance ---
+    final_tip = np.array([df.iloc[-1]['tip_pos_x'], df.iloc[-1]['tip_pos_y'], df.iloc[-1]['tip_pos_z']])
+    dist_str = ""
+    if GOAL_POSITION:
+        dist = np.linalg.norm(final_tip - np.array(GOAL_POSITION))
+        dist_str = f" | Goal-Tip Dist: {dist:.4f}m"
+
+    ax.set_title(f"Soft Robot Trajectory Evolution{dist_str}")
 
     # Static Background
     plot_cylinder(ax, radius=WORKSPACE_RADIUS, z_start=WORKSPACE_HEIGHT_START, z_end=WORKSPACE_HEIGHT_END, alpha=WORKSPACE_ALPHA)
@@ -224,7 +240,15 @@ def generate_turntable_animation(df, script_dir):
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
     setup_axes(ax)
-    ax.set_title("Soft Robot Final Configuration (360° View)")
+
+    # --- Calculate Distance ---
+    final_tip = np.array([df.iloc[-1]['tip_pos_x'], df.iloc[-1]['tip_pos_y'], df.iloc[-1]['tip_pos_z']])
+    dist_str = ""
+    if GOAL_POSITION:
+        dist = np.linalg.norm(final_tip - np.array(GOAL_POSITION))
+        dist_str = f" | Goal-Tip Dist: {dist:.4f}m"
+
+    ax.set_title(f"Soft Robot Final Configuration (360° View){dist_str}")
 
     # 1. Plot EVERYTHING statically (Ghosts + Final Shape + Environment)
     colormap = matplotlib.colormaps['jet']
