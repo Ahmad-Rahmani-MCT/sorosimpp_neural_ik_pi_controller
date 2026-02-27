@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+# %%
+import numpy as np 
+import torch 
+import random 
+import os 
+import pickle
+import rospy
+import csv
+from std_msgs.msg import Float64MultiArray 
+from tf2_msgs.msg import TFMessage
+from sklearn.preprocessing import MinMaxScaler
+import math
+
+# setting seeds
+def set_all_seeds(seed: int = 42): 
+    random.seed(seed) 
+    np.random.seed(seed) 
+    torch.manual_seed(seed) 
+set_all_seeds(42) 
+
+# configuration and model parameters
+lag_state = 3 
+lag_input = 0
+input_flat_size = 21 
+output_size = 3 
+num_hidden_layers = 1 
+hidden_units = 30 
+QUEUE_SIZE = 10
+NODE_FREQUENCY = 20.0 
+DT = 1.0 / NODE_FREQUENCY # time step for the integral
+SOROSIM_TAG = "/sorosimpp" 
+N_ACT = 3 
+REQUIRED_FRAMES = ["cs19", "tip"] 
+
+# control configuration and limits
+ACTUATION_LIMIT_MIN = 0.0
+ACTUATION_LIMIT_MAX = 18.0
+ACTUATION_RATE_LIMIT = 0.6 
+
+# model definition 
+class MLP_model(torch.nn.Module): 
+    def __init__(self, input_flat_size: int, hidden_units: int, output_size: int, num_hidden_layers: int):
+        super().__init__()
+        layers = [] 
+        in_dimension = input_flat_size 
+        self.input_layer = torch.nn.Linear(in_features=in_dimension, out_features=hidden_units) 
+        for i in range(num_hidden_layers): 
+            layers.append(torch.nn.Linear(in_features=hidden_units, out_features=hidden_units)) 
+            layers.append(torch.nn.ReLU()) 
+        self.backbone = torch.nn.Sequential(*layers) 
+        self.output_layer = torch.nn.Linear(in_features=hidden_units, out_features=output_size) 
+        self.relu = torch.nn.ReLU()
+    def forward(self, x): 
+        out = self.input_layer(x) 
+        out = self.relu(out)
+        out = self.output_layer(out) 
+        return out
+
+# loading resources 
+script_path = os.path.abspath(__file__) 
+script_dir = os.path.dirname(script_path) 
+model_directory = os.path.join(script_dir, "ik_model_lines_data")
+scaler_directory = model_directory
+
+inverse_model = MLP_model(input_flat_size, hidden_units, output_size, num_hidden_layers)  
+inverse_model.load_state_dict(torch.load(os.path.join(model_directory, "IK_MLP_lines.pth"), map_location=torch.device('cpu'))) 
+inverse_model.eval() 
+
+with open(os.path.join(scaler_directory, "input_scaler_lines.pkl"), 'rb') as file: 
+    input_scaler = pickle.load(file) 
+with open(os.path.join(scaler_directory, "state_scaler_lines.pkl"), 'rb') as file:
+    state_scaler = pickle.load(file)  
+with open(os.path.join(scaler_directory, "ee_xy_scaler.pkl"), 'rb') as file:
+    ee_xy_scaler = pickle.load(file) 
+
+# path generator
+def lin_path_gen(x_des, y_des, x_init, y_init, num_points):  
+     x = np.linspace(start=x_init, stop=x_des, num=num_points) 
+     y = np.linspace(start=y_init, stop=y_des, num=num_points) 
+     return np.column_stack((x, y)) 
+
+# control cystem class 
+class IK_CTRL_SYS:
+    def __init__(self, n_act, req_frames, state_scaler, input_scaler, IK_model, targets_list):
+        self.n_act = n_act 
+        self.required_frames = req_frames 
+        self.state_scaler = state_scaler 
+        self.input_scaler = input_scaler 
+        self.ik_model_nn = IK_model
+        
+        # Experiment state variables
+        self.targets_list = targets_list
+        self.current_target_idx = 0
+        self.experiment_results = [] # To store [target_x, target_y, final_x, final_y, error, duration]
+        
+        # State Machine: 0=Homing, 1=Moving, 2=Settling, 3=Recording, 4=Finished
+        self.state = 0 
+        self.state_start_time = rospy.get_time()
+        self.active_move_start_time = 0.0
+        self.active_duration = 0.0
+        
+        self.latched = False
+        
+        # Trajectory variables (populated dynamically)
+        self.raw_des_trajectory = None
+        self.final_target = None 
+        self.scaled_des_trajectory = None
+
+        # Limits
+        physical_limits = np.array([[ACTUATION_LIMIT_MIN]*self.n_act, [ACTUATION_LIMIT_MAX]*self.n_act])
+        scaled_limits = self.input_scaler.transform(physical_limits)
+        self.u_min_scaled = np.min(scaled_limits, axis=0)
+        self.u_max_scaled = np.max(scaled_limits, axis=0)
+        self.u_rate_limit_scaled = ACTUATION_RATE_LIMIT * self.input_scaler.scale_ 
+        
+        self.latest_tf = None 
+        self.pose_buffer = [] 
+        self.init_pose_buf_filled = False
+        self.init_u = np.zeros(self.n_act) 
+        self.current_u = self.init_u
+        self.counter = 0
+        
+        self.pub_obj = rospy.Publisher(SOROSIM_TAG + "/actuators", Float64MultiArray, queue_size=QUEUE_SIZE) 
+        self.sub_obj = rospy.Subscriber("/tf", TFMessage, self.tf_callback)
+        
+        self.init_act_msg() 
+        self.timer_obj = rospy.Timer(rospy.Duration(DT), self.main_loop)
+
+    def tf_callback(self, msg): 
+        self.latest_tf = msg 
+    
+    def init_act_msg(self): 
+        self.act_msg = Float64MultiArray()
+        self.act_msg.data = [0.0] * self.n_act
+        self.pub_obj.publish(self.act_msg)
+        
+    def filter_tf(self, tf_msg): 
+        filtered_tf = []
+        for tf_data in tf_msg.transforms: 
+            if tf_data.child_frame_id in self.required_frames: 
+                filtered_tf.append(tf_data)
+        return filtered_tf   
+    
+    def latest_poses(self, filtered_tf): 
+        cs19_pose = None
+        ee_pose = None
+        for tf_data in filtered_tf: 
+            if tf_data.child_frame_id == self.required_frames[0]: 
+                cs19_pose = tf_data.transform.translation 
+            elif tf_data.child_frame_id == self.required_frames[1]: 
+                ee_pose = tf_data.transform.translation 
+        if cs19_pose and ee_pose:
+            return [cs19_pose.x, cs19_pose.y, ee_pose.x, ee_pose.y]
+        return None
+    
+    def scale_pose(self, latest_pose): 
+        pose_np = np.array(latest_pose)
+        scaled_pose = self.state_scaler.transform(pose_np.reshape(1, -1)) 
+        return scaled_pose
+    
+    def scale_trajectory(self, raw_traj):
+        tip_scale = self.state_scaler.scale_[2:4] 
+        tip_min = self.state_scaler.min_[2:4]
+        scaled_traj = raw_traj * tip_scale + tip_min
+        return scaled_traj
+
+    def init_pose(self, current_pose):  
+        self.pose_buffer.append(current_pose)
+
+    def prepare_features(self, current_pose, current_input, des_ee_trajectory): 
+        if self.counter <= des_ee_trajectory.shape[0] - 1: 
+            future_pose_des = des_ee_trajectory[self.counter, :] 
+            self.counter += 1 
+        else: 
+            future_pose_des = des_ee_trajectory[-1, :] 
+        prev_pose_buffer_flat = np.array(self.pose_buffer).flatten() 
+        current_pose_flat = current_pose.flatten()
+        feature_prepped = np.concatenate((future_pose_des, current_pose_flat, prev_pose_buffer_flat, current_input), axis=0) 
+        return feature_prepped
+            
+    def generate_new_trajectory(self):
+        target = self.targets_list[self.current_target_idx]
+        x_des, y_des = target[0], target[1]
+        x_init, y_init = 0.0, 0.0
+        average_step_size = 0.0015
+        
+        total_distance = math.sqrt((x_des - x_init)**2 + (y_des - y_init)**2)
+        calculated_points = max(2, int(round(total_distance / average_step_size)))
+        
+        self.raw_des_trajectory = lin_path_gen(x_des, y_des, x_init, y_init, calculated_points)
+        self.final_target = self.raw_des_trajectory[-1] 
+        self.scaled_des_trajectory = self.scale_trajectory(self.raw_des_trajectory)
+        self.counter = 0
+        self.latched = False
+        rospy.loginfo(f"--- Starting Target {self.current_target_idx + 1}/100: X={x_des}, Y={y_des} ---")
+
+    def main_loop(self, event): 
+        if self.latest_tf is None: return
+        filtered_tf = self.filter_tf(self.latest_tf) 
+        if len(filtered_tf) < 2: return 
+        raw_pose = self.latest_poses(filtered_tf)
+        if raw_pose is None: return
+        latest_poses_scaled = self.scale_pose(raw_pose) 
+        
+        current_time = rospy.get_time()
+
+        # STATE 0: HOMING
+        if self.state == 0:
+            self.current_u = self.init_u # Command zeros
+            self.act_msg.data = [0.0] * self.n_act
+            self.pub_obj.publish(self.act_msg)
+            
+            if current_time - self.state_start_time >= 5.0: # Wait 5 seconds
+                self.generate_new_trajectory()
+                self.pose_buffer.clear()
+                self.init_pose_buf_filled = False
+                self.active_move_start_time = current_time
+                self.state = 1 # Switch to moving
+            return
+
+        # Buffer filling logic (only happens at start of STATE 1)
+        if not self.init_pose_buf_filled: 
+            if len(self.pose_buffer) < lag_state:
+                self.init_pose(latest_poses_scaled) 
+            else:
+                self.init_pose_buf_filled = True   
+            return
+
+        # STATE 1: MOVING (Neural Network)
+        if self.state == 1:
+            if self.counter >= self.scaled_des_trajectory.shape[0]:
+                # Trajectory finished
+                self.latched = True
+                self.active_duration = current_time - self.active_move_start_time # Record ONLY active time
+                rospy.loginfo(f"Trajectory finished in {self.active_duration:.2f}s. Settling for 3s...")
+                self.state_start_time = current_time
+                self.state = 2 # Switch to settling
+                return 
+
+            in_feature = self.prepare_features(current_pose=latest_poses_scaled, 
+                                            current_input=self.current_u, 
+                                            des_ee_trajectory=self.scaled_des_trajectory) 
+            tensor_in = torch.tensor(in_feature, dtype=torch.float32).unsqueeze(0)
+            network_out = self.ik_model_nn(tensor_in) 
+            raw_output = network_out.detach().squeeze(0).numpy()
+
+            delta_u = raw_output - self.current_u
+            delta_u_clamped = np.clip(delta_u, -self.u_rate_limit_scaled, self.u_rate_limit_scaled)
+            self.current_u = np.clip(self.current_u + delta_u_clamped, self.u_min_scaled, self.u_max_scaled)
+            
+            self.pose_buffer = self.pose_buffer[1:] + [latest_poses_scaled] 
+            real_actuation = self.input_scaler.inverse_transform(self.current_u.reshape(1, -1))
+            self.act_msg.data = real_actuation.flatten().tolist()
+            self.pub_obj.publish(self.act_msg)
+
+        # STATE 2: SETTLING
+        elif self.state == 2:
+            self.pub_obj.publish(self.act_msg) # Keep holding last command
+            if current_time - self.state_start_time >= 3.0: # Wait 3 seconds
+                self.state = 3 # Switch to recording
+            return
+
+        # STATE 3: RECORDING
+        elif self.state == 3:
+            tip_current = np.array(raw_pose[2:4])
+            error = np.linalg.norm(tip_current - self.final_target)
+            
+            # Save data row
+            self.experiment_results.append([
+                self.final_target[0], self.final_target[1], 
+                tip_current[0], tip_current[1], 
+                error, self.active_duration
+            ])
+            rospy.loginfo(f"Target {self.current_target_idx + 1} Error: {error:.4f}m. Saved.")
+            
+            self.current_target_idx += 1
+            if self.current_target_idx < len(self.targets_list):
+                rospy.loginfo("Resetting to [0,0,0] for 5s...")
+                self.state_start_time = current_time
+                self.state = 0 # Loop back to home
+            else:
+                self.state = 4 # Finished
+        
+        # STATE 4: FINISHED
+        elif self.state == 4:
+            self.save_results()
+            rospy.loginfo("--- ALL 100 TARGETS COMPLETED ---")
+            rospy.signal_shutdown("Experiment finished cleanly.")
+
+    def save_results(self):
+        file_path = os.path.join(script_dir, "experiment_results_NN_only.csv")
+        with open(file_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Target_X', 'Target_Y', 'Final_X', 'Final_Y', 'Error_m', 'Duration_s'])
+            writer.writerows(self.experiment_results)
+        rospy.loginfo(f"Results saved to {file_path}")
+
+def load_targets(filename="workspace_targets.csv"):
+    file_path = os.path.join(script_dir, filename)
+    targets = []
+    with open(file_path, mode='r') as file:
+        reader = csv.reader(file)
+        next(reader) # Skip header
+        for row in reader:
+            targets.append([float(row[0]), float(row[1])])
+    return targets
+
+# execution 
+def main(): 
+    rospy.init_node("IK_cntrl_sys_experiment", anonymous=True) 
+    
+    # Load the 100 targets generated previously
+    try:
+        targets_list = load_targets("workspace_targets.csv")
+        rospy.loginfo(f"Successfully loaded {len(targets_list)} targets.")
+    except Exception as e:
+        rospy.logerr(f"Could not load workspace_targets.csv: {e}")
+        return
+
+    IK_CTRL_SYS(n_act=N_ACT, req_frames=REQUIRED_FRAMES, state_scaler=state_scaler, input_scaler=input_scaler, IK_model=inverse_model,
+                targets_list=targets_list)
+    rospy.spin() 
+
+if __name__ == '__main__': 
+    main()
