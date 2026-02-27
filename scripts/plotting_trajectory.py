@@ -18,7 +18,7 @@ WORKSPACE_RADIUS = 0.1
 WORKSPACE_HEIGHT_START = 0.0
 WORKSPACE_HEIGHT_END = -0.4
 WORKSPACE_ALPHA = 0.05
-GOAL_POSITION = [-0.07, -0.07, -0.39]  # Set to None if no goal
+GOAL_POSITION = [0.07, -0.07, -0.377]  # Set to None if no goal
 
 # --- ANIMATION SETTINGS ---
 VIDEO_DURATION_SEC = 10   # Duration for both Trace and Turntable videos
