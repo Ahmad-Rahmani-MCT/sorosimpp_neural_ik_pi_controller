@@ -41,6 +41,14 @@ ACTUATION_RATE_LIMIT = 0.6
 # experiment durations in steps (assuming 20Hz)
 HOME_STEPS = 100    # 5 seconds
 SETTLE_STEPS = 60   # 3 seconds
+PI_TIMEOUT = 400    # 20 seconds max for PI to prevent infinite loops
+PI_DWELL_STEPS = 20 # 1 second of continuous stability required (<2mm)
+
+# PI configuration
+TARGET_TOLERANCE = 0.002 # 2 mm
+PID_KP = -20  
+PID_KI = -20   
+ACT_ANGLES = [math.radians(90), math.radians(330), math.radians(210)]
 
 # model definition 
 class MLP_model(torch.nn.Module): 
@@ -96,14 +104,18 @@ class IK_CTRL_SYS:
         # Experiment state variables
         self.targets_list = targets_list
         self.current_target_idx = 0
-        self.experiment_results = [] # To store [target_x, target_y, final_x, final_y, error, active_steps]
+        self.experiment_results = [] # To store [target_x, target_y, final_x, final_y, error, nn_steps, total_steps]
         
         # State Machine counters
         self.state = 0 
         self.state_step_counter = 0
         self.active_steps = 0
+        self.nn_active_steps = 0
+        self.pi_dwell_counter = 0 # New counter to track stability
         
-        self.latched = False
+        # PI variables
+        self.latched_u_base = None 
+        self.integral_error = np.zeros(2)
         
         # Trajectory variables (populated dynamically)
         self.raw_des_trajectory = None
@@ -181,7 +193,29 @@ class IK_CTRL_SYS:
         current_pose_flat = current_pose.flatten()
         feature_prepped = np.concatenate((future_pose_des, current_pose_flat, prev_pose_buffer_flat, current_input), axis=0) 
         return feature_prepped
-            
+    
+    def calculate_fine_tuning(self, current_pose_raw):
+        # error calculation as Error = Target - Current Pose 
+        tip_current = np.array(current_pose_raw[2:4])
+        error_vector = self.final_target - tip_current 
+        
+        # updating the integral (clamped)
+        self.integral_error += error_vector * DT
+        self.integral_error = np.clip(self.integral_error, -0.5, 0.5) 
+        
+        # geometric projection of error along actuator angles (positions)
+        delta_u_phys = np.zeros(self.n_act)
+        for i in range(self.n_act):
+            angle = ACT_ANGLES[i]
+            proj_p = error_vector[0] * math.cos(angle) + error_vector[1] * math.sin(angle)
+            proj_i = self.integral_error[0] * math.cos(angle) + self.integral_error[1] * math.sin(angle)
+            force = (PID_KP * proj_p) + (PID_KI * proj_i)
+            delta_u_phys[i] = force
+
+        # scaling
+        delta_u_scaled = delta_u_phys * self.input_scaler.scale_ 
+        return delta_u_scaled
+
     def generate_new_trajectory(self):
         target = self.targets_list[self.current_target_idx]
         x_des, y_des = target[0], target[1]
@@ -194,8 +228,11 @@ class IK_CTRL_SYS:
         self.raw_des_trajectory = lin_path_gen(x_des, y_des, x_init, y_init, calculated_points)
         self.final_target = self.raw_des_trajectory[-1] 
         self.scaled_des_trajectory = self.scale_trajectory(self.raw_des_trajectory)
+        
         self.counter = 0
-        self.latched = False
+        self.integral_error = np.zeros(2) # Reset PI integral for new target
+        self.pi_dwell_counter = 0 # Reset stabilization counter
+        
         rospy.loginfo(f"--- Starting Target {self.current_target_idx + 1}/{len(self.targets_list)}: X={x_des:.4f}, Y={y_des:.4f} ---")
 
     def main_loop(self, event): 
@@ -213,13 +250,14 @@ class IK_CTRL_SYS:
             self.pub_obj.publish(self.act_msg)
             
             self.state_step_counter += 1
-            if self.state_step_counter >= HOME_STEPS: # Wait 100 steps
+            if self.state_step_counter >= HOME_STEPS:
                 self.generate_new_trajectory()
                 self.pose_buffer.clear()
                 self.init_pose_buf_filled = False
                 self.active_steps = 0
+                self.nn_active_steps = 0
                 self.state_step_counter = 0
-                self.state = 1 # Switch to moving
+                self.state = 1 # Switch to NN moving
             return
 
         # Buffer filling logic (only happens at start of STATE 1)
@@ -233,11 +271,11 @@ class IK_CTRL_SYS:
         # STATE 1: MOVING (Neural Network)
         if self.state == 1:
             if self.counter >= self.scaled_des_trajectory.shape[0]:
-                # Trajectory finished
-                self.latched = True
-                rospy.loginfo(f"Trajectory finished in {self.active_steps} steps. Settling for {SETTLE_STEPS} steps...")
-                self.state_step_counter = 0
-                self.state = 2 # Switch to settling
+                # Trajectory finished - Transition to PI Control
+                self.nn_active_steps = self.active_steps # Save NN effort
+                self.latched_u_base = self.current_u.copy() 
+                rospy.loginfo(f"Path finished in {self.nn_active_steps} steps. Activating PI Controller...")
+                self.state = 2 # Switch to PI
                 return 
 
             self.active_steps += 1
@@ -258,16 +296,54 @@ class IK_CTRL_SYS:
             self.act_msg.data = real_actuation.flatten().tolist()
             self.pub_obj.publish(self.act_msg)
 
-        # STATE 2: SETTLING
+        # STATE 2: MOVING (PI Fine-Tuning)
         elif self.state == 2:
-            self.pub_obj.publish(self.act_msg) # Keep holding last command
+            self.active_steps += 1
+            
+            # Check current error
+            tip_current = np.array(raw_pose[2:4])
+            error = np.linalg.norm(tip_current - self.final_target)
+            
+            # Increment stability counter if within tolerance, else reset it
+            if error <= TARGET_TOLERANCE:
+                self.pi_dwell_counter += 1
+            else:
+                self.pi_dwell_counter = 0
+            
+            # Stop condition: Held within 2mm for full dwell time OR Timeout reached
+            if self.pi_dwell_counter >= PI_DWELL_STEPS or (self.active_steps - self.nn_active_steps) >= PI_TIMEOUT:
+                if self.pi_dwell_counter >= PI_DWELL_STEPS:
+                    rospy.loginfo(f"Target stabilized (<2mm for 1s) in {self.active_steps} total steps. Settling...")
+                else:
+                    rospy.logwarn("PI Timeout reached. Settling...")
+                    
+                self.state_step_counter = 0
+                self.state = 3 # Switch to settling
+                return
+            
+            # Apply PI Control (Actively fights oscillations while dwelling)
+            delta_pi_scaled = self.calculate_fine_tuning(raw_pose)
+            target_u = self.latched_u_base + delta_pi_scaled
+            
+            delta_u = target_u - self.current_u
+            delta_u_clamped = np.clip(delta_u, -self.u_rate_limit_scaled, self.u_rate_limit_scaled)
+            self.current_u = np.clip(self.current_u + delta_u_clamped, self.u_min_scaled, self.u_max_scaled)
+            
+            self.pose_buffer = self.pose_buffer[1:] + [latest_poses_scaled] 
+            real_actuation = self.input_scaler.inverse_transform(self.current_u.reshape(1, -1))
+            self.act_msg.data = real_actuation.flatten().tolist()
+            self.pub_obj.publish(self.act_msg)
+
+        # STATE 3: SETTLING
+        elif self.state == 3:
+            self.pub_obj.publish(self.act_msg) # Keep holding last PI command
             self.state_step_counter += 1
-            if self.state_step_counter >= SETTLE_STEPS: # Wait 60 steps
-                self.state = 3 # Switch to recording
+            if self.state_step_counter >= SETTLE_STEPS:
+                self.state = 4 # Switch to recording
             return
 
-        # STATE 3: RECORDING
-        elif self.state == 3:
+        # STATE 4: RECORDING
+        elif self.state == 4:
             tip_current = np.array(raw_pose[2:4])
             error = np.linalg.norm(tip_current - self.final_target)
             
@@ -275,9 +351,9 @@ class IK_CTRL_SYS:
             self.experiment_results.append([
                 self.final_target[0], self.final_target[1], 
                 tip_current[0], tip_current[1], 
-                error, self.active_steps
+                error, self.nn_active_steps, self.active_steps
             ])
-            rospy.loginfo(f"Target {self.current_target_idx + 1} Error: {error:.4f}m. Saved.")
+            rospy.loginfo(f"Target {self.current_target_idx + 1} Final Error: {error:.4f}m. Saved.")
             
             self.current_target_idx += 1
             if self.current_target_idx < len(self.targets_list):
@@ -285,19 +361,19 @@ class IK_CTRL_SYS:
                 self.state_step_counter = 0
                 self.state = 0 # Loop back to home
             else:
-                self.state = 4 # Finished
+                self.state = 5 # Finished
         
-        # STATE 4: FINISHED
-        elif self.state == 4:
+        # STATE 5: FINISHED
+        elif self.state == 5:
             self.save_results()
             rospy.loginfo("--- ALL 100 TARGETS COMPLETED ---")
             rospy.signal_shutdown("Experiment finished cleanly.")
 
     def save_results(self):
-        file_path = os.path.join(script_dir, "experiment_results_NN_only.csv")
+        file_path = os.path.join(script_dir, "experiment_results_NN_PI.csv")
         with open(file_path, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['Target_X', 'Target_Y', 'Final_X', 'Final_Y', 'Error_m', 'Active_Steps'])
+            writer.writerow(['Target_X', 'Target_Y', 'Final_X', 'Final_Y', 'Error_m', 'NN_Steps', 'Total_Steps'])
             writer.writerows(self.experiment_results)
         rospy.loginfo(f"Results saved to {file_path}")
 
@@ -313,9 +389,9 @@ def load_targets(filename="workspace_targets.csv"):
 
 # execution 
 def main(): 
-    rospy.init_node("IK_cntrl_sys_experiment", anonymous=True) 
+    rospy.init_node("IK_cntrl_sys_experiment_PI", anonymous=True) 
     
-    # Load the 100 targets generated previously
+    # Load the 100 targets
     try:
         targets_list = load_targets("workspace_targets.csv")
         rospy.loginfo(f"Successfully loaded {len(targets_list)} targets.")
